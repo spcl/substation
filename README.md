@@ -4,7 +4,15 @@ Substation is a project to optimize transformers using data movement analysis.
 
 This code is presently at a research-and-development stage. We are actively working to make it both faster and more usable.
 
-For more background, please see our paper, [_Data Movement Is All You Need: A Case Study on Optimizing Transformers_](https://arxiv.org/abs/2007.00072).
+For more background, please see our paper, [_Data Movement Is All You Need: A Case Study on Optimizing Transformers_](https://arxiv.org/abs/2007.00072). If you use our code, please cite the paper:
+```
+@article{ivanov2020data,
+  title={Data Movement Is All You Need: A Case Study on Optimizing Transformers},
+  author={Ivanov, Andrei and Dryden, Nikoli and Ben-Nun, Tal and Li, Shigang and Hoefler, Torsten},
+  journal={arXiv preprint arXiv:2007.00072},
+  year={2020}
+}
+```
 
 ## Current Performance
 
