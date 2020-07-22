@@ -1,0 +1,6 @@
+__pycache__/
+.idea/
+.dacecache/
+_dotgraphs/
+*.nvvp
+/substation/*.sdfg

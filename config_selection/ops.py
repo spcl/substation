@@ -1,5 +1,7 @@
 import os.path
 import functools
+import itertools
+import time
 from collections import namedtuple, defaultdict
 from load_data import *
 
@@ -281,13 +283,9 @@ same_vars = [
     ('LINB2', 'DLINB2'),
     ('S2', 'DS2'),
     ('B2', 'DB2'),
-    # Dropout mask and tensor must match:
-    ('ATTN_DROP_MASK', 'ATTN_DROP'),
     # These need to match because they are stacked:
     # Removed because of issues with j vs k.
     #('DQQ', 'DKK', 'DVV')
-    # Presently, a hack:
-    ('DKKQQVV', 'WKKWQQWVV')
 ]
 # This augments same_vars to also require sameness between forward prop
 # activations and the corresponding backward error signals.
@@ -328,6 +326,32 @@ bwd_combined_operators = [
 ]
 
 
+def layout_len(layouts):
+    """Return the number of layouts in a layout dict."""
+    return len(next(iter(layouts.values())))
+
+
+def _layout_iterator_no_cfg(layouts, restrict=None):
+    """Faster version of layout_iterator when cfg is None."""
+    vars = list(restrict) if restrict else list(layouts.keys())
+    restricted_layouts = {var: layouts[var] for var in vars}
+    num_layouts = len(restricted_layouts[vars[0]])
+    for i in range(num_layouts):
+        yield {var: restricted_layouts[var][i] for var in vars}
+
+
+def bare_layout_iterator(layouts, order=None):
+    """Yield layouts without the dict.
+
+    The order is that given by layouts.keys() if order is None.
+
+    """
+    if order is None:
+        order = list(layouts.keys())
+    layouts = [layouts[var] for var in order]
+    yield from zip(*layouts)
+
+
 def layout_iterator(layouts, restrict=None, cfg=None):
     """A generator that yields each overall layout in layouts.
 
@@ -343,16 +367,18 @@ def layout_iterator(layouts, restrict=None, cfg=None):
 
     """
     if cfg is None:
-        cfg = {}
-    vars = list(restrict) if restrict else list(layouts.keys())
-    num_layouts = len(layouts[vars[0]])
-    for i in range(num_layouts):
-        match = True
-        for var, layout in cfg.items():
-            if layouts[var][i] != layout:
-                match = False
-        if not match: continue
-        yield {var: layouts[var][i] for var in vars}
+        yield from _layout_iterator_no_cfg(layouts, restrict=restrict)
+    else:
+        vars = list(restrict) if restrict else list(layouts.keys())
+        num_layouts = len(layouts[vars[0]])
+        for i in range(num_layouts):
+            match = True
+            for var, layout in cfg.items():
+                if layouts[var][i] != layout:
+                    match = False
+                    break
+                if not match: continue
+                yield {var: layouts[var][i] for var in vars}
 
 
 def filter_layouts(x, vars):
@@ -368,8 +394,8 @@ def filter_layouts(x, vars):
     if x is None:
         return None
     vars = set(vars)
-    if type(x) in (list, tuple):
-        x = [var for var in x if var in vars]
+    if type(x) in (list, tuple, set):
+        x = type(x)([var for var in x if var in vars])
     elif type(x) is dict:
         x = {var: x[var] for var in x if var in vars}
     else:
@@ -378,6 +404,303 @@ def filter_layouts(x, vars):
         return None
     else:
         return x
+
+
+def restrict_layout_configs(layouts, cfg):
+    """Restrict layouts to contain only layouts that match cfg.
+
+    cfg is a dict mapping variables to a fixed layout. It is allowable
+    for cfg to have variables that are not in layouts: they will be
+    ignored.
+
+    """
+    if not cfg:
+        return layouts
+    cfg = filter_layouts(cfg, layouts.keys())
+    if not cfg:
+        return layouts
+    vars = list(layouts.keys())
+    restrict_vars = list(cfg.keys())
+    restrict_cfg = tuple(cfg[var] for var in restrict_vars)
+    restrict_indices = [vars.index(var) for var in restrict_vars]
+    restrict_indices_cfg = tuple(zip(restrict_indices, restrict_cfg))
+    new_layouts = {var: [] for var in vars}
+    for bare_layout in bare_layout_iterator(layouts, order=vars):
+        if all(bare_layout[idx] == layout for idx, layout in restrict_indices_cfg):
+            for var, layout in zip(vars, bare_layout):
+                new_layouts[var].append(layout)
+    return new_layouts
+
+
+def remap_vars_by_sameness(x, y, sameness):
+    """Rename vars in x to be those in y based on sameness.
+
+    Every variable in x is mapped to the corresponding variable in y.
+    It is allowable that x have fewer variables than y, but there must
+    be a corresponding variable in y for every variable in x.
+
+    """
+    name_map = defaultdict(list)
+    for var in x:
+        for same_var in sameness[var]:
+            if same_var in y:
+                name_map[var].append(same_var)
+        if var not in name_map:
+            raise ValueError(f'Do not know how to remap {var} in {x} using {y}')
+    if type(x) in (list, tuple, set):
+        new_x = []
+        for var in x:
+            new_x += name_map[var]
+        new_x = type(x)(new_x)
+    elif type(x) is dict:
+        new_x = {}
+        for var in x:
+            for new_var in name_map[var]:
+                new_x[new_var] = x[var]
+    else:
+        raise ValueError(f'Do not know how to remap {x}')
+    return new_x
+
+
+def remap_subset_by_sameness(x, y, sameness):
+    """Return and rename the subset of x corresponding to y.
+
+    This is like remap_vars_by_sameness, but will return only the subset
+    of x that matches y.
+
+    """
+    # Identify the common subset.
+    subset = []
+    for var in x:
+        for same_var in sameness[var]:
+            if same_var in y:
+                subset.append(var)
+                break
+    subset_x = filter_layouts(x, subset)
+    return remap_vars_by_sameness(subset_x, y, sameness)
+
+
+def freeze_dict(d):
+    """Return a frozen version of dict that is hashable."""
+    return tuple(sorted(d.items()))
+
+
+def merge_two_layouts_no_shared(layouts1, layouts2):
+    """Merge two sets of layouts, having no variables in common.
+
+    layouts1 and layouts2 should be dicts of lists of layouts for
+    each variable, as returned by Operator.get_unique_layouts.
+
+    """
+    # Ensure no common variables:
+    assert not (set(layouts1.keys()) & set(layouts2.keys()))
+    # Essentially, for each layout in layouts1, this will add every
+    # layout in layouts2 to the output.
+    new_layouts = {var: [] for var in
+                   itertools.chain(layouts1.keys(), layouts2.keys())}
+    num_layout2s = len(next(iter(layouts2.values())))
+    for layout1 in layout_iterator(layouts1):
+        # Entries from layout1 are duplicated, add them all here.
+        for var, layout in layout1.items():
+            new_layouts[var].extend([layout]*num_layout2s)
+        for layout2 in layout_iterator(layouts2):
+            for var, layout in layout2.items():
+                new_layouts[var].append(layout)
+    return new_layouts
+
+
+def get_common_vars(layouts1, layouts2, sameness):
+    """Return the set of common variables between layout sets."""
+    if sameness is None:
+        return None
+    common_vars = set()
+    for var in layouts1.keys():
+        for same_var in sameness[var]:
+            if same_var in layouts2:
+                common_vars.add(var)
+                break
+    return common_vars
+
+
+def merge_two_layouts(layouts1, layouts2, sameness=None):
+    """Merge two sets of layouts, which may have variables in common.
+
+    If there are incompatible layouts of common variables, they are dropped.
+
+    If sameness is not None, it is a map from variable names to all variables
+    which a variable must have the same layouts as.
+
+    """
+    # Provide a default sameness map.
+    if sameness is None:
+        sameness = {var: [var] for var
+                    in itertools.chain(layouts1.keys(), layouts2.keys())}
+    # Identify common variables between the two sets, accounting for sameness.
+    # For variables that need to be the same, this stores the variable from
+    # layouts1.
+    common_vars = get_common_vars(layouts1, layouts2, sameness)
+    if not common_vars:
+        return merge_two_layouts_no_shared(layouts1, layouts2)
+    # First find the unique set of layouts for the common variables among the
+    # two sets of layouts.
+    # From this point, we drop dicts for layouts for efficiency. The order of
+    # variables is given implicitly by common_vars.
+    shared_layouts1 = set(zip(*[layouts1[var] for var in common_vars]))
+    # Pick the subset of layouts2 that corresponds to common_vars and remap the variables.
+    remapped_layouts2_subset = remap_subset_by_sameness(
+        layouts2, common_vars, sameness)
+    shared_layouts2 = set(zip(
+        *[remapped_layouts2_subset[var] for var in common_vars]))
+    shared_layouts = shared_layouts1 & shared_layouts2
+    if not shared_layouts:
+        raise RuntimeError(f'No common layouts to expand, {layouts1.keys()} and {layouts2.keys()}')
+    # Now construct a map from the shared layouts to *every* layout in layouts2
+    # that matches the shared layout.
+    # This precomputation lets us avoid repeated iteration over layouts2 below.
+    # This does not remap vars in the final layout, but does filter out the
+    # variables that are exactly the same between layouts1 and layouts2 (without
+    # considering sameness).
+    new_layouts = {var: [] for var in
+                   itertools.chain(layouts1.keys(), layouts2.keys())}
+    layout1_vars = list(layouts1.keys())
+    layout1_common_indices = [layout1_vars.index(var) for var in common_vars]
+    layouts2_only_vars = set(layouts2.keys()) - common_vars
+    if layouts2_only_vars:
+        layout_map = {layout: [] for layout in shared_layouts}
+        for shared_layout, bare_layout in zip(
+                bare_layout_iterator(remapped_layouts2_subset, order=common_vars),
+                bare_layout_iterator(layouts2, order=layouts2_only_vars)):
+            if shared_layout in layout_map:
+                layout_map[shared_layout].append(bare_layout)
+        # Finally, for every layout in layouts1, add every layout in layouts2 where
+        # the shared variables have matching layouts.
+        for bare_layout1 in bare_layout_iterator(layouts1):
+            shared_layout = tuple(bare_layout1[idx] for idx in layout1_common_indices)
+            if shared_layout not in layout_map:
+                # Layout does not have a match in the other set, skip.
+                continue
+            # The entries from layout1 are duplicated, so add them all here.
+            num_layout2s = len(layout_map[shared_layout])
+            for var, layout in zip(layout1_vars, bare_layout1):
+                new_layouts[var].extend([layout]*num_layout2s)
+            for bare_layout2 in layout_map[shared_layout]:
+                for var, layout in zip(layouts2_only_vars, bare_layout2):
+                    new_layouts[var].append(layout)
+    else:
+        # In this case, every variable in layouts2 is also in layouts1, even
+        # without accounting for sameness, so we don't need a mapping.
+        for bare_layout1 in bare_layout_iterator(layouts1):
+            shared_layout = tuple(bare_layout1[idx] for idx in layout1_common_indices)
+            if shared_layout not in shared_layouts:
+                continue
+            for var, layout in zip(layout1_vars, bare_layout1):
+                new_layouts[var].append(layout)
+    return new_layouts
+
+
+def merge_layouts(layouts, sameness=None):
+    """Iteratively merge layouts."""
+    new_layouts = layouts[0]
+    ordered_layouts = layouts[1:]
+    # Order based on sets of layouts that have variables in common with what
+    # we first picked, to reduce overall time.
+    # Could pick a better overall order if needed (by picking new_layouts better).
+    if sameness:
+        ordered_layouts.sort(key=lambda x: len(get_common_vars(
+            new_layouts, x, sameness)), reverse=True)
+    for op_layout in ordered_layouts:
+        new_layouts = merge_two_layouts(new_layouts, op_layout,
+                                        sameness=sameness)
+    return new_layouts
+
+
+def get_compatible_layouts_pair(layouts1, layouts2, sameness):
+    """Return the layouts from each set that are compatible.
+
+    This is like merge_two_layouts, except instead of constructing the
+    cross-product of valid layouts to explicitly materialize the merge,
+    it returns the sets separately.
+
+    """
+    # Identify common variables, accounting for sameness.
+    # This stores variables under their name in layouts1.
+    common_vars = get_common_vars(layouts1, layouts2, sameness)
+    if not common_vars:
+        # No common variables, so nothing to filter out.
+        return layouts1, layouts2
+    # Find the unique sets of layouts for the common variables.
+    common_layouts1 = set(zip(*[layouts1[var] for var in common_vars]))
+    remapped_layouts2_subset = remap_subset_by_sameness(
+        layouts2, common_vars, sameness)
+    common_layouts2 = set(zip(
+        *[remapped_layouts2_subset[var] for var in common_vars]))
+    # Identify the layouts that match between the two.
+    shared_layouts = common_layouts1 & common_layouts2
+    if not shared_layouts:
+        # No common layouts, these are incompatible.
+        raise RuntimeError(f'No common layouts to expand, {layouts1.keys()} and {layouts2.keys()}')
+    # Now filter both layout sets to contain only the shared layouts.
+    # We use two stages, the first filters and then the second constructs
+    # the new layout dicts. This lets us use list comprehensions for both,
+    # which is way faster. (I haven't figured out how to do it in one pass
+    # with list comprehensions.)
+    layout1_vars = list(layouts1.keys())
+    new_layouts1_tmp = [bare_layout1 for shared_layout, bare_layout1 in zip(
+        bare_layout_iterator(layouts1, order=common_vars),
+        bare_layout_iterator(layouts1, order=layout1_vars))
+                        if shared_layout in shared_layouts]
+    new_layouts1 = {}
+    for i, var in enumerate(layout1_vars):
+        new_layouts1[var] = [bare_layout1[i] for bare_layout1 in new_layouts1_tmp]
+    layout2_vars = list(layouts2.keys())
+    new_layouts2_tmp = [bare_layout2 for shared_layout, bare_layout2 in zip(
+        bare_layout_iterator(remapped_layouts2_subset, order=common_vars),
+        bare_layout_iterator(layouts2, order=layout2_vars))
+                        if shared_layout in shared_layouts]
+    new_layouts2 = {}
+    for i, var in enumerate(layout2_vars):
+        new_layouts2[var] = [bare_layout2[i] for bare_layout2 in new_layouts2_tmp]
+
+    return new_layouts1, new_layouts2
+
+
+def get_compatible_layouts(layouts, sameness):
+    """Return the set of layouts that is compatible among all layouts.
+
+    This is like merge_layouts, but does not explicitly build the
+    cross-product.
+
+    """
+    # We need to iterate and compare all pairs of layouts to make sure
+    # information propagates. This is potentially quite slow with many
+    # operators, but does avoid materializing large lists.
+    new_layouts = layouts[:]
+    while True:
+        changed = False
+        for idx1, idx2 in itertools.product(range(len(layouts)), repeat=2):
+            if idx1 == idx2:
+                continue  # A layout is trivially compatible with itself.
+            # Normally things are symmetric, but they can not be when
+            # get_common_vars differs, typically when one layout has multiple
+            # variables that are the same.
+            if idx2 < idx1 and (
+                    get_common_vars(new_layouts[idx1], new_layouts[idx2], sameness)
+                    == get_common_vars(new_layouts[idx2], new_layouts[idx1], sameness)):
+                continue
+            layouts1, layouts2 = new_layouts[idx1], new_layouts[idx2]
+            new_layouts1, new_layouts2 = get_compatible_layouts_pair(
+                layouts1, layouts2, sameness)
+            # Since this only filters, we can check for changes by checking
+            # whether the length changed.
+            if layout_len(layouts1) != layout_len(new_layouts1):
+                changed = True
+                new_layouts[idx1] = new_layouts1
+            if layout_len(layouts2) != layout_len(new_layouts2):
+                changed = True
+                new_layouts[idx2] = new_layouts2
+        if not changed:
+            break
+    return new_layouts
 
 
 class Operator:
@@ -410,57 +733,68 @@ class Operator:
         if self.data is not None:
             print(f'{self.name} loaded {len(self.data)} configs')
 
+        # For caching partial restricts up to two levels.
+        self.restrict_cache = {}
+
         # Set up inputs/output details.
         # inputs/output are a list of input/output variables.
         self.inputs, self.outputs = [], []
-        # Maps variables to the corresponding dataframe columns and vice-versa.
-        # In general, this is to a single column but one variable can
-        # be used for multiple columns (occurs with bdrln1).
-        # These cases are skipped for simplicity.
-        self.var_map = {}
-        self.df_to_var = {}
-        for (var, data_var) in opdef.input:
+        # This will rename dataframe columns appropriately.
+        # When the same variable is mapped to multiple columns
+        # (occurs in bdrln1), we ensure we keep only rows where the columns
+        # are equal, and then drop the extra columns.
+        var_map = defaultdict(list)
+        for var, data_var in opdef.input:
             if data_var not in self.data.columns:
                 raise ValueError(f'Input var {var}->{data_var} not in data for {self.name}')
             self.inputs.append(var)
-            if var in self.var_map:
-                #self.var_map[var].append(data_var)
-                continue
-            else:
-                self.var_map[var] = [data_var]
-            if data_var in self.df_to_var:
-                #self.df_to_var[data_var].append(var)
-                continue
-            else:
-                self.df_to_var[data_var] = [var]
-        for (var, data_var) in opdef.output:
+            var_map[var].append(data_var)
+        for var, data_var in opdef.output:
             if data_var not in self.data.columns:
                 raise ValueError(f'Output var {var}->{data_var} not in data for {self.name}')
             self.outputs.append(var)
-            if var in self.var_map:
-                #self.var_map[var].append(data_var)
-                continue
-            else:
-                self.var_map[var] = [data_var]
-            if data_var in self.df_to_var:
-                #self.df_to_var[data_var].append(var)
-                continue
-            else:
-                self.df_to_var[data_var] = [var]
+            var_map[var].append(data_var)
+        # Build the rename map, identify columns mapped to the same variable,
+        # and which columns to drop.
+        rename_map = {}
+        cols_to_drop = []
+        for var, data_vars in var_map.items():
+            # Arbitrarily map the first column to this variable.
+            rename_map[data_vars[0]] = var
+            if len(data_vars) > 1:
+                # Restrict to rows where columns match.
+                # May be a better way to do this.
+                keep = self.data[data_vars[0]] == self.data[data_vars[1]]
+                for data_var in data_vars[2:]:
+                    keep = keep == self.data[data_var]
+                self.data = self.data[keep]
+                # Drop all remaining columns.
+                cols_to_drop += data_vars[1:]
+        # Drop and rename.
+        if cols_to_drop:
+            self.data.drop(columns=cols_to_drop, inplace=True)
+        self.data.rename(columns=rename_map, inplace=True)
 
+        # Convenience for accessing all variables.
+        self.all_vars = set(self.inputs + self.outputs)
+
+        # Remap specials.
         self.specials = []
-        self.specials_map = {}  # Map specials to dataframe columns.
         if opdef.special:
+            rename_map = {}
             for special in opdef.special:
                 # For simplicity, since most do not change.
                 if type(special) is tuple:
-                    self.specials_map[special[0]] = special[1]
+                    if special[1] not in self.data.columns:
+                        raise ValueError(f'Special {special[0]}->{special[1]} not in data for {self.name}')
+                    rename_map[special[1]] = special[0]
+                    self.specials.append(special[0])
                 else:
-                    self.specials_map[special] = special
-        for special, specialdf in self.specials_map.items():
-            self.specials.append(special)
-            if specialdf not in self.data.columns:
-                raise ValueError(f'Special {special}->{specialdf} not in data for {self.name}')
+                    if special not in self.data.columns:
+                        raise ValueError(f'Special {special}->{special} not in data for {self.name}')
+                    self.specials.append(special)
+            if rename_map:
+                self.data.rename(columns=rename_map, inplace=True)
 
 
     def get_unique_layouts(self, vars=None, cfg=None):
@@ -488,40 +822,58 @@ class Operator:
         if cfg:
             restrict = True
             for var, layout in cfg.items():
-                for dfvar in self._vars2df(var):
-                    restrict = restrict & (self.data[dfvar] == layout)
+                restrict = restrict & (self.data[var] == layout)
             df = self.data[restrict]
         else:
             df = self.data
-        df = df.drop_duplicates(self._vars2df(vars))
+        df = df.drop_duplicates(vars)
         cfgs = {}
         for var in vars:
-            cfgs[var] = list()
-            for dfvar in self._vars2df(var):
-                cfgs[var] += list(df[dfvar])
+            cfgs[var] = list(df[var])
         return cfgs
 
 
-    def get_min_config(self, cfg=None):
+    def get_min_config(self, cfg=None, cache=False):
         """Return the configuration with minimum time.
 
         cfg can be used to optionally restrict the minimum to be only over
         vars with a particular layout. It should be a dict mapping vars to
         the bound layout.
 
+        If cache is True, partial restricts will be cached to speed up
+        repeated calls with similar cfgs.
+
         """
         if cfg is None:
             return self._get_row(self.data['time'].idxmin())
 
-        # There might be a better way to do this.
-        # This iteratively builds up the matching indices.
-        restrict = True
-        for var, layout in cfg.items():
-            if var in self.specials: continue
-            for dfvar in self._vars2df(var):
-                restrict = restrict & (self.data[dfvar] == layout)
+        if cache:
+            var_order = sorted([var for var in cfg.keys() if var not in self.specials])
+            cache_vars = 2 if len(var_order) > 3 else 1
+            cache_key = tuple((var, cfg[var]) for var in var_order[:cache_vars])
+            if cache_key in self.restrict_cache:
+                restricted_df = self.restrict_cache[cache_key]
+            else:
+                restrict = True
+                for var, layout in cache_key:
+                    restrict = restrict & (self.data[var] == layout)
+                restricted_df = self.data[restrict]
+                self.restrict_cache[cache_key] = restricted_df
+            if len(var_order) > cache_vars:
+                restrict = True
+                for var in var_order[cache_vars:]:
+                    restrict = restrict & (restricted_df[var] == cfg[var])
+                restricted_df = restricted_df[restrict]
+        else:
+            # There might be a better way to do this.
+            # This iteratively builds up the matching indices.
+            restrict = True
+            for var, layout in cfg.items():
+                if var in self.specials: continue
+                restrict = restrict & (self.data[var] == layout)
+            restricted_df = self.data[restrict]
         try:
-            return self._get_row(self.data[restrict]['time'].idxmin())
+            return self._get_row(restricted_df['time'].idxmin())
         except ValueError as e:
             print(f'Exception with restrict config {cfg} in {self.name}')
             raise e
@@ -537,11 +889,10 @@ class Operator:
         """
         layout = {}
         for var in self.inputs + self.outputs:
-            for dfvar in self._vars2df(var):
-                layout[var] = config[dfvar]
+            layout[var] = config[var]
         if specials:
-            for special, specialdf in self.specials_map.items():
-                layout[special] = config[specialdf]
+            for special in self.specials:
+                layout[special] = config[special]
         return layout
 
 
@@ -571,30 +922,6 @@ class Operator:
                 lambda x: x.replace('j', 'k'))
 
 
-    def _vars2df(self, vars):
-        """Translate every var in vars to the dataframe column."""
-        if type(vars) not in (list, tuple):
-            vars = [vars]
-        mapped = []
-        for var in vars:
-            if var not in self.var_map:
-                raise ValueError(f'Unknown variable {var} for {self.name}')
-            mapped += self.var_map[var]
-        return mapped
-
-
-    def _df2vars(self, vars):
-        """Translate every var in vars to the regular variable name."""
-        if type(vars) not in (list, tuple):
-            vars = [vars]
-        mapped = []
-        for var in vars:
-            if var not in self.df_to_var:
-                raise ValueError(f'Unknown variable {var} for {self.name}')
-            mapped += self.df_to_var[var]
-        return mapped
-
-
 # Used by Split/MergeOperator for returning configs.
 DummyEntry = namedtuple('DummyEntry', ['time', 'cfg'])
 
@@ -621,6 +948,7 @@ class SplitOperator:
         if len(self.inputs) != 1:
             raise ValueError(f'Split {self.name} does not support more than one input')
         self.outputs = opdef.output
+        self.all_vars = set(self.inputs + self.outputs)
         self.specials = []
 
         # Precompute layouts.
@@ -650,7 +978,7 @@ class SplitOperator:
         return layouts
 
 
-    def get_min_config(self, cfg=None):
+    def get_min_config(self, cfg=None, cache=False):
         """Like Operator.get_min_config.
 
         This returns a "fake" configuration, not a real Pandas object.
@@ -683,6 +1011,7 @@ class MergeOperator:
         self.outputs = opdef.output
         if len(self.outputs) != 1:
             raise ValueError(f'Merge {self.name} does not support more than one output')
+        self.all_vars = set(self.inputs + self.outputs)
         self.specials = []
 
         # Precompute layouts.
@@ -723,7 +1052,7 @@ class MergeOperator:
         return layouts
 
 
-    def get_min_config(self, cfg=None):
+    def get_min_config(self, cfg=None, cache=False):
         """Like Operator.get_min_config.
 
         This returns a "fake" configuration, not a real Pandas object.
@@ -756,6 +1085,7 @@ class CombinedOperator:
             
         self.inputs = list(inputs)
         self.outputs = list(outputs)
+        self.all_vars = set(self.inputs + self.outputs)
         self.specials = []
 
 
@@ -771,13 +1101,10 @@ class CombinedOperator:
             op_layouts = op.get_unique_layouts(op_vars, cfg=op_cfg)
             layouts.append(op_layouts)
         # Expand and merge layouts.
-        new_layouts = layouts[0]
-        for op_layout in layouts[1:]:
-            new_layouts = self._expand_layouts(new_layouts, op_layout)
-        return new_layouts
+        return merge_layouts(layouts)
 
 
-    def get_min_config(self, cfg=None):
+    def get_min_config(self, cfg=None, cache=False):
         """Like Operator.get_min_config.
 
         This returns a "fake" configuration, not a real Pandas object.
@@ -789,7 +1116,7 @@ class CombinedOperator:
         op_configs = {}
         for op in self.ops:
             op_cfg = filter_layouts(cfg, op.inputs + op.outputs)
-            op_config = op.get_min_config(op_cfg)
+            op_config = op.get_min_config(op_cfg, cache=cache)
             op_configs[op.name] = op_config
             t += op_config.time
         return DummyEntry(t, op_configs)
@@ -819,71 +1146,6 @@ class CombinedOperator:
                     else:
                         layout[var] = var_layout
         return layout
-
-
-    def _expand_layouts_no_shared(self, layouts1, layouts2):
-        """Merge two sets of layouts, when they have no variables in common."""
-        # Essentially, for each layout in layouts1, this will add every
-        # layout in layouts2.
-        # Verify no variables in common:
-        assert not (set(layouts1.keys()) & set(layouts2.keys()))
-        new_layouts = {var: [] for var in list(layouts1.keys()) + list(layouts2.keys())}
-        for layout1 in layout_iterator(layouts1):
-            for layout2 in layout_iterator(layouts2):
-                for var, layout in layout1.items():
-                    new_layouts[var].append(layout)
-                for var, layout in layout2.items():
-                    new_layouts[var].append(layout)
-        return new_layouts
-
-
-    def _expand_layouts(self, layouts1, layouts2):
-        """Merge two sets of layouts, which may have variables in common.
-
-        If there are incompatible layouts of common variables, they are dropped.
-
-        """
-        # If there are none in common, use the other function.
-        common_vars = set(layouts1.keys()) & set(layouts2.keys())
-        if not common_vars:
-            return self._expand_layouts_no_shared(layouts1, layouts2)
-        # We first find the unique set of layouts in common between the two
-        # among the shared variables.
-        shared_layouts1, shared_layouts2 = set(), set()
-        for layout in layout_iterator(layouts1, restrict=common_vars):
-            layout = tuple(sorted(layout.items()))
-            shared_layouts1.add(layout)
-        for layout in layout_iterator(layouts2, restrict=common_vars):
-            layout = tuple(sorted(layout.items()))
-            shared_layouts2.add(layout)
-        shared_layouts = shared_layouts1 & shared_layouts2
-        if not shared_layouts:
-            raise RuntimeError('No common layouts to expand.')
-        # Then we build a map from those to *every* layout in layouts2 that
-        # matches this layout.
-        layout_map = {layout: [] for layout in shared_layouts}
-        for layout in layout_iterator(layouts2):
-            shared_layout = {var: layout[var] for var in common_vars}
-            shared_layout = tuple(sorted(shared_layout.items()))
-            if shared_layout in layout_map:
-                layout_map[shared_layout].append(layout)
-        # Finally, for every layout in layouts1, we add every layout in layouts2
-        # where the shared variables match.
-        new_layouts = {var: [] for var in list(layouts1.keys()) + list(layouts2.keys())}
-        for layout1 in layout_iterator(layouts1):
-            shared_layout = {var: layout1[var] for var in common_vars}
-            shared_layout = tuple(sorted(shared_layout.items()))
-            if shared_layout not in layout_map:
-                # Not fully sure when this happens, but possibly with
-                # configuration restrictions.
-                continue
-            for layout2 in layout_map[shared_layout]:
-                for var, layout in layout1.items():
-                    new_layouts[var].append(layout)
-                for var, layout in layout2.items():
-                    if var not in common_vars:  # Don't add again.
-                        new_layouts[var].append(layout)
-        return new_layouts
 
 
 def load_operator(opdef, result_dir, loaded_ops):
@@ -983,15 +1245,18 @@ class Variables:
                             raise ValueError(f'Unknown variable {var2} in same constraint for {var}')
                     same_map[var] |= constraint
         # Now iterate until this converges to propagate all sameness.
-        old_same_map = same_map
+        old_same_map = dict(same_map)
         while True:
             for var, same_set in same_map.items():
                 for same_var in same_set:
                     same_map[same_var] |= same_set
             if same_map == old_same_map:
                 break
-            old_same_map = same_map
+            old_same_map = dict(same_map)
         self.same_map = same_map
+
+        # Precompute layouts for operators and variables.
+        self._precompute_layouts()
 
         # Sanity check that every variable has at least one layout.
         for var in self.vars_to_ops.keys():
@@ -1001,6 +1266,7 @@ class Variables:
 
         # Sanity check that every operator has at least one possible layout.
         for opname in self.ops:
+            t = time.perf_counter()
             layouts = self.get_valid_unique_layouts(opname)
             if not next(iter(layouts.values())):
                 print(f'WARNING: Operator {opname} has no valid configurations!')
@@ -1031,51 +1297,7 @@ class Variables:
 
 
     @functools.lru_cache(maxsize=None)
-    def get_valid_unique_layouts(self, opname, vars=None, cfg=None):
-        """Return unique layouts for operator.
-
-        This is the same as Operator.get_unique_layouts except it will
-        take into account constraints (sameness, layouts supported by
-        other operators).
-
-        Specifically, this will eliminate layouts if they are used for
-        a variable and:
-        - The variable is used by another op that does not support that
-        layout.
-        - The variable must be the same as another variable, and that
-        variable is used by an op that does not support the layout.
-
-        Note this does not deal with propagating constraints on variables,
-        which is a TODO.
-
-        This also will not account for *joint* layouts between variables:
-        Some operators cannot produce some layouts for two variables
-        simultaneously.
-
-        """
-        if cfg is not None:
-            # Because of caching, need to convert back to dict.
-            regular_cfg = dict(cfg)
-        else:
-            regular_cfg = None
-        layouts = self.ops[opname].get_unique_layouts(vars, cfg=regular_cfg)
-        # Note that we are not concerned about the order of layouts here.
-        # Essentially we filter out layouts that other operators do not accept.
-        layout_sets = {var: self.get_layouts_for_var(var, cfg=cfg) for var in layouts}
-        # Now filter the layouts.
-        indices_to_remove = set()
-        for var in layouts.keys():
-            for i, layout in enumerate(layouts[var]):
-                if layout not in layout_sets[var]:
-                    indices_to_remove.add(i)
-        filtered_layouts = {}
-        for var in layouts.keys():
-            filtered_layouts[var] = [x for i, x in enumerate(layouts[var])
-                                     if i not in indices_to_remove]
-        return filtered_layouts
-
-
-    def get_valid_unique_layouts2(self, opname, vars=None, cfg=None, binding=None):
+    def get_valid_unique_layouts(self, opname, vars=None, binding=None):
         """Return valid unique layouts for operator.
 
         This is like Operator.get_unique_layouts, except it will
@@ -1088,40 +1310,68 @@ class Variables:
         - The prior constraint is also satisfied for all variables that
         must be the same as the variables used by the operator.
 
-        Note this does not propagate constraints on variables. That is,
-        this considers only "first-order" constraints on operators that
-        directly use variables. It does not, for example, consider whether
-        chosing a layout for one variable might constrain other operators
-        such that they have no possible layouts. (For example: The choice
-        of an output variable for one operator may mean that the possible
-        output layouts of a second operator are constrained such that a
-        third operator now has no valid layouts.)
+        This *should* account for propagating constraints on variables.
+        That is, picking a layout for one variable might constrain some
+        operator such that the output layouts it can produce now result
+        in some other operator having constraints on layouts.
 
         """
-        pass
+        if binding:
+            # Only have to recompute if we restrict layouts further.
+            # Turn back into a dict.
+            frozen_binding = binding
+            binding = dict(binding)
+            # First check if anything in the binding is set for the ops.
+            if not any([self.get_op_config_from_binding(op, binding) for
+                        op in self.compatible_op_layouts]):
+                layouts = self.compatible_op_layouts[opname]
+            else:
+                # Check if we cached this.
+                if frozen_binding in self.compatible_op_layouts_cache:
+                    compatible_layouts = self.compatible_op_layouts_cache[frozen_binding]
+                else:
+                    # Use precomputed layouts, restricted by the binding.
+                    layouts = [
+                        restrict_layout_configs(
+                            op_layout, self.get_op_config_from_binding(op, binding))
+                        for op, op_layout in self.compatible_op_layouts.items()]
+                    # Reapply this to propagate any further restrictions.
+                    compatible_layouts = get_compatible_layouts(layouts, self.same_map)
+                    # Cache.
+                    self.compatible_op_layouts_cache[frozen_binding] = compatible_layouts
+                op_idx = list(self.compatible_op_layouts.keys()).index(opname)
+                layouts = compatible_layouts[op_idx]
+        else:
+            layouts = self.compatible_op_layouts[opname]
+        # Now restrict the layout by vars and unique'ify.
+        if vars is None:
+            vars = self.ops[opname].inputs + self.ops[opname].outputs
+        unique_layouts_set = set(bare_layout_iterator(layouts, order=vars))
+        unique_layouts = {var: [] for var in vars}
+        for bare_layout in unique_layouts_set:
+            for var, layout in zip(vars, bare_layout):
+                unique_layouts[var].append(layout)
+        return unique_layouts
 
 
-    @functools.lru_cache(maxsize=None)
-    def get_layouts_for_var(self, var, cfg=None):
+    def get_layouts_for_var(self, var, binding=None):
         """Return the set of possible layouts for var.
 
-        This accounts for what an operator can output as well as
-        sameness constraints.
+        This accounts for possible restrictions on the variable's layout
+        due to sameness or what operators accept.
 
         """
-        if cfg is not None:
-            cfg = dict(cfg)
-        layouts = []
-        for same_var in self.same_map[var]:
-            for op in self.vars_to_ops[same_var]:
-                # Only pass along relevant variables.
-                op_cfg = filter_layouts(cfg, op.inputs + op.outputs)
-                layout_set = set(op.get_unique_layouts([same_var], cfg=op_cfg)[same_var])
-                layouts.append(layout_set)
-        valid_layouts = layouts[0]
-        for layout_set in layouts[1:]:
-            valid_layouts &= layout_set
-        return valid_layouts
+        if binding:
+            if binding[var] is not None:
+                # Only one possible layout: The one you already picked.
+                return set([binding[var]])
+            # Just get the set of unique layouts for an operator that uses var.
+            layouts = self.get_valid_unique_layouts(
+                self.vars_to_ops[var][0].name, vars=(var,),
+                binding=freeze_dict(binding))
+            return set(layouts[var])
+        else:
+            return self.compatible_var_layouts[var]
 
 
     def empty_var_binding(self):
@@ -1147,6 +1397,21 @@ class Variables:
         return new_binding
 
 
+    def update_binding_from_cfg(self, binding, cfg):
+        """Update a binding based on a configuration.
+
+        This will bind all variables in cfg to their given layouts.
+
+        """
+        new_binding = dict(binding)
+        for var, layout in cfg.items():
+            for same_var in self.same_map[var]:
+                if binding[same_var] is not None and binding[same_var] != layout:
+                    raise RuntimeError(f'Tried to bind {var} to {layout} but {same_var} already has layout {new_binding[same_var]}')
+                new_binding[same_var] = layout
+        return new_binding
+
+
     def get_op_config_from_binding(self, opname, binding, hashable=False):
         """Return a cfg dict (for get_unique_layouts) for opname based on the
         currently bound variables in binding.
@@ -1157,13 +1422,15 @@ class Variables:
         If hashable is True, this will return a hashable "dict".
 
         """
+        if not binding:
+            return None
         cfg = {}
         for var in self.ops[opname].inputs + self.ops[opname].outputs:
             if binding[var] is not None:
                 cfg[var] = binding[var]
         if cfg:
             if hashable:
-                return tuple(sorted(cfg.items()))
+                return freeze_dict(cfg)
             else:
                 return cfg
         else:
@@ -1172,23 +1439,44 @@ class Variables:
 
     def minimize_binding(self, binding):
         """Set unbound variable layouts in binding to minimize time."""
-        # This is a simple greedy approach. Better would be to minimize over
-        # all operators that use the variable.
+        # Handle trivial bindings where the variable has only one layout.
+        # Iterate on this in case binding variables reduces layouts on others.
+        while True:
+            bound_something = False
+            for var in binding:
+                if binding[var] is not None: continue
+                var_layouts = self.get_layouts_for_var(var, binding)
+                if len(var_layouts) == 1:
+                    binding[var] = var_layouts.pop()
+                    bound_something = True
+            if not bound_something:
+                break
+
         for var in list(binding.keys()):
             if binding[var] is not None: continue
-            # Just pick the first operator to use for this.
-            op = self.vars_to_ops[var][0]
-            bound_vars, unbound_vars = {}, []
-            for op_var in op.inputs + op.outputs:
-                if binding[op_var] is None:
-                    unbound_vars.append(op_var)
-                else:
-                    bound_vars[op_var] = binding[op_var]
-            # Find the minimum config with the bound variables.
-            cfg = op.get_min_config(bound_vars)
-            cfg_layout = op.get_layout_for_config(cfg)
-            for unbound_var in unbound_vars:
-                binding[unbound_var] = cfg_layout[unbound_var]
+            # Find the set of operators influenced by var directly or through
+            # other unbound variables used by the same operators.
+            vars_to_bind, ops_involved = self._get_influenced_ops_and_vars(
+                var, binding)
+            # It tends to get too expensive to minimize exhaustively over too
+            # many operators, so skip over to the greedy approach.
+            while len(ops_involved) > 3:
+                print(f'Too many ops {", ".join([op.name for op in ops_involved])} '
+                      f'(need to bind {", ".join(vars_to_bind)}), switching to greedy')
+                binding = self._greedy_bind_one_op(ops_involved, binding)
+                vars_to_bind, ops_involved = self._get_influenced_ops_and_vars(
+                    var, binding)
+            if not vars_to_bind:
+                continue  # var got bound greedily.
+            # Now do exhaustive minimization over all possible layouts.
+            print(f'Exhaustively minimizing over {", ".join([op.name for op in ops_involved])}')
+            min_layout = self._exhaustively_minimize_ops(ops_involved, binding)
+            print(f'Exhaustively minimized {", ".join([op.name for op in ops_involved])}, setting',
+                  ' '.join([f'{var}={layout}' for var, layout in min_layout.items()]))
+            # Now bind the variables.
+            for unbound_var in vars_to_bind:
+                binding[unbound_var] = min_layout[unbound_var]
+
         return binding
 
 
@@ -1220,7 +1508,98 @@ class Variables:
         return configs
 
 
-# Try binding variables from FP ops before doing backprop optimization
-# Try optimizing backprop before forward prop
-# Improve minimize_binding to consider constraints on all operators that use a variable
-# Improve minimize_binding to minimize over all operators that use the variable
+    def _precompute_layouts(self):
+        """Precompute valid layouts for variables and operators."""
+        op_order = list(self.ops.keys())
+        layouts = [self.ops[opname].get_unique_layouts() for opname in op_order]
+        compatible_layouts = get_compatible_layouts(layouts, self.same_map)
+        self.compatible_op_layouts = {opname: layout for opname, layout in zip(
+            op_order, compatible_layouts)}
+        for opname, layouts in self.compatible_op_layouts.items():
+            if not layout_len(layouts):
+                raise RuntimeError(f'No compatible layouts for {opname}')
+        self.compatible_var_layouts = {}
+        for var, ops in self.vars_to_ops.items():
+            self.compatible_var_layouts[var] = set(
+                self.compatible_op_layouts[ops[0].name][var])
+            if not self.compatible_var_layouts[var]:
+                raise RuntimeError(f'No compatible layouts for {var}')
+            # Sanity check.
+            for op in ops[1:]:
+                if self.compatible_var_layouts[var] != set(
+                        self.compatible_op_layouts[op.name][var]):
+                    raise RuntimeError(f'Compatible layouts for {var} do not match across ops')
+        self.compatible_op_layouts_cache = {}
+
+
+    def _get_influenced_ops_and_vars(self, var, binding):
+        """Get variables and operators influenced by binding var.
+
+        If var is bound, this returns empty sets.
+
+        """
+        if binding[var]:
+            return set(), set()
+        vars_to_bind = set([var])
+        ops_involved = set()
+        old_vars_to_bind = set(vars_to_bind)
+        while True:
+            # Add ops that use vars.
+            for unbound_var in vars_to_bind:
+                ops_involved.update(self.vars_to_ops[unbound_var])
+            # Add new unbound vars from the ops.
+            for op in ops_involved:
+                for op_var in op.inputs + op.outputs:
+                    # Only need to check sameness here:
+                    # If it were bound, all vars that are the same are bound.
+                    if binding[op_var] is None:
+                        for same_var in self.same_map[op_var]:
+                            vars_to_bind.add(same_var)
+            if vars_to_bind == old_vars_to_bind:
+                break
+            old_vars_to_bind = set(vars_to_bind)
+        return vars_to_bind, ops_involved
+
+    def _exhaustively_minimize_ops(self, ops_involved, binding):
+        """Exhaustively search for the minimal binding of ops."""
+        layouts = [self.get_valid_unique_layouts(
+            op.name, binding=freeze_dict(binding)) for op in ops_involved]
+        layouts = merge_layouts(layouts, sameness=self.same_map)
+        print(f'Considering {layout_len(layouts)} layouts...')
+        min_t = float('inf')
+        min_layout = None
+        for layout in layout_iterator(layouts):
+            total_t = 0.0
+            for op in ops_involved:
+                op_cfg = filter_layouts(layout, op.inputs + op.outputs)
+                total_t += op.get_min_config(cfg=op_cfg, cache=True).time
+            if total_t < min_t:
+                min_t = total_t
+                min_layout = layout
+        return min_layout
+
+
+    def _greedy_bind_one_op(self, ops_involved, binding):
+        """Pick a binding for one operator in ops.
+
+        This is meant to reduce the number of involved operators/variables
+        to make exhaustive minimization feasible later.
+
+        Right now we pick the minimum layout for the most expensive operator.
+
+        """
+        min_cfgs = {op.name: op.get_min_config(
+            cfg=self.get_op_config_from_binding(op.name, binding))
+                    for op in ops_involved}
+        # Now pick the most expensive operator.
+        max_op = max(min_cfgs, key=lambda x: min_cfgs[x].time)
+        min_layout = self.ops[max_op].get_layout_for_config(min_cfgs[max_op])
+        print(f'Greedily binding {max_op}, setting',
+              ' '.join([f'{var}={layout}' for var, layout in min_layout.items()]))
+        for var, layout in min_layout.items():
+            if binding[var] is None:
+                binding = self.set_var_binding(binding, var, layout)
+            else:
+                # Sanity check.
+                assert binding[var] == layout
+        return binding

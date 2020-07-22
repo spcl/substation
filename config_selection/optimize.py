@@ -4,7 +4,7 @@ import itertools
 import pickle
 
 import ops
-from ops import load_ops, Variables
+from ops import load_ops, Variables, freeze_dict, layout_len, layout_iterator
 
 import numpy as np
 import networkx as nx
@@ -74,6 +74,28 @@ def build_graph(ops, vars):
     return G
 
 
+def concatenate_graphs(op_graphs):
+    """Concatenate a list of operator graphs.
+
+    The graphs will be concatenated in the order given. Each graph
+    must have exactly one node with in-degree 0 and one node with
+    out-degree 0. An edge with no variables will be added from the
+    node with out-degree 0 to the node with in-degree 0 in the next
+    graph.
+
+    The nodes in the each graph must be unique.
+
+    """
+    new_G = nx.DiGraph()
+    for G in op_graphs:
+        new_G.add_edges_from(G.edges(data=True))
+    for G, next_G in zip(op_graphs, op_graphs[1:]):
+        end_node = next(node for node, out_degree in G.out_degree() if out_degree == 0)
+        start_node = next(node for node, in_degree in next_G.in_degree() if in_degree == 0)
+        new_G.add_edge(end_node, start_node, vars=None, concat=True)
+    return new_G
+
+
 def prune_graph_forward(opG):
     """Prune edges for optimizing the forward prop graph."""
     pass  # Nothing to prune.
@@ -84,7 +106,118 @@ def prune_graph_backward(opG):
     opG.remove_edge('combined_dX1gamma_dX2gamma', 'combined_QKV-merge_baib')
 
 
-def build_sssp_graph(ops, opG, vars, start_op, input_var, output_var, binding):
+def add_sssp_edges_for_op(ssspG, vars, op, index, in_vars, out_vars, binding,
+                          split_idx, prev_split_idx=None):
+    """Add edges for op to an SSSP graph."""
+    prev_split_idx = prev_split_idx or split_idx
+    # For concatenation edges, where there are no variables.
+    layouts = vars.get_valid_unique_layouts(
+        op.name, tuple(in_vars) + tuple(out_vars), binding=freeze_dict(binding))
+    num_layouts = layout_len(layouts)
+    print(f'{op.name}: Input vars: {in_vars} | output vars {out_vars} | {num_layouts} layouts')
+    for cfg_idx in range(num_layouts):
+        cfg_binding = dict(binding)
+        for var in in_vars | out_vars:
+            cfg_binding = vars.set_var_binding(cfg_binding, var, layouts[var][cfg_idx])
+        cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
+        in_cfg = freeze_dict({var: cfg[var] for var in in_vars})
+        in_node = (f'{prev_split_idx}_{index}', in_cfg)
+        if in_node not in ssspG.nodes and index > 0:
+            # The first op needs to add its sources, so not an error.
+            raise RuntimeError(f'{op.name} trying to add edge but source {in_node} does not exist!')
+        out_cfg = freeze_dict({var: cfg[var] for var in out_vars})
+        out_node = (f'{split_idx}_{index+1}', out_cfg)
+        weight = op.get_min_config(cfg).time
+        ssspG.add_edge(in_node, out_node,
+                       weight=weight,
+                       cfg=cfg, op=op)
+        #print(f'{op.name}: adding edge {in_node}->{out_node} weight={weight}')
+
+
+def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
+                      input_vars, output_vars, binding,
+                      split_vars, split_idx='0', prev_split_idx=None):
+    """Add operators to the SSSP graph.
+
+    The first time a variable in split_vars is encountered, instead of
+    constructing the SSSP graph with a single set of layouts, each layout
+    for that variable will be fixed and the remainder of the SSSP graph
+    duplicated for each layout.
+
+    """
+    split_vars = set(split_vars)
+    for i in range(len(node_order)):
+        prev_split_idx = prev_split_idx or split_idx
+        op = ops[node_order[i]]
+        vars_to_split_on = split_vars & op.all_vars
+        split_vars -= vars_to_split_on
+        if op.name in input_vars:
+            in_vars = set(input_vars[op.name])
+        else:
+            in_vars = opG.edges[(node_order[i-1], node_order[i])]['vars']
+        if op.name in output_vars:
+            out_vars = set(output_vars[op.name])
+        else:
+            out_vars = opG.edges[(node_order[i], node_order[i+1])]['vars']
+        # Check if this is a concatenation edge.
+        if i > 0:
+            in_concat = 'concat' in opG.edges[(node_order[i-1], node_order[i])]
+        else:
+            in_concat = False
+        if i < len(node_order) - 1:
+            out_concat = 'concat' in opG.edges[(node_order[i], node_order[i+1])]
+        else:
+            out_concat = False
+        if vars_to_split_on:
+            layouts = vars.get_valid_unique_layouts(
+                op.name, tuple(vars_to_split_on), binding=freeze_dict(binding))
+            print(f'Splitting SSSP graph on variables {", ".join(vars_to_split_on)}, {layout_len(layouts)} layouts')
+            # Make sure the subsequent call picks up the right variables.
+            input_vars[op.name] = in_vars
+            for cfg_idx, cfg in enumerate(layout_iterator(layouts)):
+                split_binding = vars.update_binding_from_cfg(binding, cfg)
+                extend_sssp_graph(ssspG, vars, ops, opG, node_order[i:],
+                                  index + i, input_vars, output_vars,
+                                  split_binding, split_vars,
+                                  f'{cfg_idx}_{split_idx}', split_idx)
+            # The rest of the graph was generated by the recursive calls.
+            break
+        else:
+            if in_concat:
+                # Add edges from concat node to the input layouts for op.
+                in_layouts = vars.get_valid_unique_layouts(
+                    op.name, tuple(in_vars), binding=freeze_dict(binding))
+                concat_node = f'{prev_split_idx}_{index+i-1}_concat'
+                for layout in layout_iterator(in_layouts):
+                    cfg_binding = vars.update_binding_from_cfg(binding, layout)
+                    cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
+                    in_cfg = freeze_dict({var: cfg[var] for var in in_vars})
+                    in_node = (f'{prev_split_idx}_{index+i}', in_cfg)
+                    ssspG.add_edge(concat_node, in_node,
+                                   weight=0.0, cfg=None, op=None)
+                    #print(f'{op.name}: adding concat edge {concat_node}->{in_node}')
+            add_sssp_edges_for_op(
+                ssspG, vars, op, index + i, in_vars, out_vars,
+                binding, split_idx, prev_split_idx)
+            if out_concat:
+                # Add edges from output layouts of op to concat node.
+                out_layouts = vars.get_valid_unique_layouts(
+                    op.name, tuple(out_vars), binding=freeze_dict(binding))
+                concat_node = f'{split_idx}_{index+i}_concat'
+                for layout in layout_iterator(out_layouts):
+                    cfg_binding = vars.update_binding_from_cfg(binding, layout)
+                    cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
+                    out_cfg = freeze_dict({var: cfg[var] for var in out_vars})
+                    out_node = (f'{split_idx}_{index+i+1}', out_cfg)
+                    ssspG.add_edge(out_node, concat_node,
+                                   weight=0.0, cfg=None, op=None)
+                    #print(f'{op.name}: adding concat edge {out_node}->{concat_node}')
+        # Reset since we are now past the split point.
+        prev_split_idx = None
+
+
+def build_sssp_graph(ops, opG, vars, start_op, input_vars, output_vars, binding,
+                     split_vars=None):
     """Generate an SSSP graph for optimizing operator layout.
 
     Currently this only works when ops are for forward prop.
@@ -93,59 +226,29 @@ def build_sssp_graph(ops, opG, vars, start_op, input_var, output_var, binding):
     complex interactions.
 
     """
+    split_vars = split_vars or []
     G = nx.DiGraph()
-    # Add source/target nodes for SSSP.
-    G.add_node('source')
-    G.add_node('target')
     # Generate the order operators will be added to the graph.
     # Note this presently breaks for backprop.
     node_order = list(nx.dfs_preorder_nodes(opG, start_op))
-    # Add edges from source.
-    layouts = vars.get_valid_unique_layouts(
-        node_order[0], (input_var,),
-        cfg=vars.get_op_config_from_binding(node_order[0], binding, hashable=True))
-    for cfg in layouts[input_var]:
-        out_cfg = {input_var: cfg}
-        out_cfg = tuple(sorted(out_cfg.items()))
-        G.add_edge('source', (0, out_cfg),
-                   weight=0.0, cfg=None, op=None)
-        print(f'source: adding edge source->{(0, {input_var: cfg})}')
     # Add main edges for each operator.
-    for i in range(len(node_order)):
-        op = ops[node_order[i]]
-        if i == 0:
-            in_vars = set([input_var])
-        else:
-            in_vars = opG.edges[(node_order[i-1], node_order[i])]['vars']
-        if i == len(node_order) - 1:
-            out_vars = set([output_var])
-        else:
-            out_vars = opG.edges[(node_order[i], node_order[i+1])]['vars']
-        layouts = vars.get_valid_unique_layouts(
-            op.name, tuple(in_vars) + tuple(out_vars),
-            cfg=vars.get_op_config_from_binding(op.name, binding, hashable=True))
-        num_layouts = len(layouts[next(iter(in_vars))])
-        print(f'{op.name}: Input vars: {in_vars} | output vars: {out_vars} | {num_layouts} layouts')
-        for cfg_idx in range(num_layouts):
-            in_cfg = {var: layouts[var][cfg_idx] for var in in_vars}
-            in_cfg = tuple(sorted(in_cfg.items()))
-            in_node = (i, in_cfg)
-            if in_node not in G.nodes:
-                # TODO: This should be fixed in get_valid_unique_layouts.
-                continue
-                #raise RuntimeError(f'{op.name} trying to add edge, but source {(i, in_cfg)} does not exist!')
-            out_cfg = {var: layouts[var][cfg_idx] for var in out_vars}
-            out_cfg = tuple(sorted(out_cfg.items()))
-            if i == len(node_order) - 1:
-                # For last node, all edges go to the target.
-                out_node = 'target'
-            else:
-                out_node = (i+1, out_cfg)
-            cfg = {var: layouts[var][cfg_idx] for var in in_vars | out_vars}
-            G.add_edge(in_node, out_node,
-                       weight=op.get_min_config(cfg).time,
-                       cfg=cfg, op=op)
-            print(f'{op.name}: adding edge {in_node}->{out_node}')
+    extend_sssp_graph(G, vars, ops, opG, node_order, 0,
+                      input_vars, output_vars, binding,
+                      split_vars)
+    # Add edges from source.
+    for node in [node for node, in_degree in G.in_degree() if in_degree == 0]:
+        G.add_edge('source', node,
+                   weight=0.0, cfg=None, op=None)
+        #print(f'source: adding edge source->{node}')
+    # Add edges to target.
+    for node in [node for node, out_degree in G.out_degree() if out_degree == 0]:
+        # This ensures we only add edges from nodes that are for the last op.
+        # Not sure if we really need this check.
+        if next(iter(G.in_edges(node, data=True)))[2]['op'].name == node_order[-1]:
+            G.add_edge(node, 'target',
+                       weight=0.0, cfg=None, op=None)
+            #print(f'target: adding edge {node}->target')
+    print(f'SSSP graph contains {G.number_of_nodes()} nodes and {G.number_of_edges()} edges')
     return G
 
 
@@ -188,9 +291,29 @@ def bind_backward_vars(vars, ssspG, sssp_configs, binding):
 
     return binding
 
+def bind_combined_vars(vars, ssspG, sssp_configs, binding):
+    """Generate bindings for variables from a configuration."""
+    for edge in zip(sssp_configs, sssp_configs[1:]):
+        if ssspG.edges[edge]['cfg'] is None: continue
+        for var, layout in ssspG.edges[edge]['cfg'].items():
+            binding = vars.set_var_binding(binding, var, layout)
 
-def optimize_configurations(fwd_ops, bwd_ops):
-    """Find the optimal end-to-end configuration."""
+    print('Bound variables after optimization:')
+    for var, layout in binding.items():
+        if layout is not None:
+            print(f'{var}: {layout}')
+
+    return binding
+
+
+def optimize_configurations(fwd_ops, bwd_ops, graph_order,
+                            split_vars=None):
+    """Find the optimal end-to-end configuration.
+
+    If fp_first is True, optimize over forward propagation first. By
+    default, backpropagation is optimized first.
+
+    """
     vars = Variables(fwd_ops, bwd_ops, ops.same_vars,
                      ops.fwd_combined_operators, ops.bwd_combined_operators)
     print('Set up Variables')
@@ -199,22 +322,65 @@ def optimize_configurations(fwd_ops, bwd_ops):
     bwd_opG = build_graph(vars.bwd_ops, vars)
     prune_graph_backward(bwd_opG)
     binding = vars.empty_var_binding()
-    print('Optimizing forward pass')
-    fwd_ssspG = build_sssp_graph(
-        vars.fwd_ops, fwd_opG, vars, ops.fwd_operators[0].name,
-        ops.fwd_input_var, ops.fwd_output_var, binding)
-    fwd_sssp_configs = nx.shortest_path(
-        fwd_ssspG, 'source', 'target', weight='weight')
-    print('Forward SSSP done')
-    binding = bind_forward_vars(vars, fwd_ssspG, fwd_sssp_configs, binding)
-    print('Optimizing backward pass')
-    bwd_ssspG = build_sssp_graph(
-        vars.bwd_ops, bwd_opG, vars, ops.bwd_operators[0].name,
-        ops.bwd_input_var, ops.bwd_output_var, binding)
-    bwd_sssp_configs = nx.shortest_path(
-        bwd_ssspG, 'source', 'target', weight='weight')
-    print('Backward SSSP done')
-    binding = bind_backward_vars(vars, bwd_ssspG, bwd_sssp_configs, binding)
+    if graph_order == 'fp_first':
+        print('Optimizing forward pass')
+        fwd_ssspG = build_sssp_graph(
+            vars.fwd_ops, fwd_opG, vars, ops.fwd_operators[0].name,
+            {ops.fwd_operators[0].name: [ops.fwd_input_var]},
+            {ops.fwd_operators[-1].name: [ops.fwd_output_var]},
+            binding)
+        fwd_sssp_configs = nx.shortest_path(
+            fwd_ssspG, 'source', 'target', weight='weight')
+        print('Forward SSSP done')
+        binding = bind_forward_vars(vars, fwd_ssspG, fwd_sssp_configs, binding)
+        print('Optimizing backward pass')
+        bwd_ssspG = build_sssp_graph(
+            vars.bwd_ops, bwd_opG, vars, ops.bwd_operators[0].name,
+            {ops.bwd_operators[0].name: [ops.bwd_input_var]},
+            {ops.bwd_operators[-1].name: [ops.bwd_output_var]},
+            binding)
+        bwd_sssp_configs = nx.shortest_path(
+            bwd_ssspG, 'source', 'target', weight='weight')
+        print('Backward SSSP done')
+        binding = bind_backward_vars(vars, bwd_ssspG, bwd_sssp_configs, binding)
+    elif graph_order == 'bp_first':
+        print('Optimizing backward pass')
+        bwd_ssspG = build_sssp_graph(
+            vars.bwd_ops, bwd_opG, vars, ops.bwd_operators[0].name,
+            {ops.bwd_operators[0].name: [ops.bwd_input_var]},
+            {ops.bwd_operators[-1].name: [ops.bwd_output_var]},
+            binding)
+        bwd_sssp_configs = nx.shortest_path(
+            bwd_ssspG, 'source', 'target', weight='weight')
+        print('Backward SSSP done')
+        binding = bind_backward_vars(vars, bwd_ssspG, bwd_sssp_configs, binding)
+        print('Optimizing forward pass')
+        fwd_ssspG = build_sssp_graph(
+            vars.fwd_ops, fwd_opG, vars, ops.fwd_operators[0].name,
+            {ops.fwd_operators[0].name: [ops.fwd_input_var]},
+            {ops.fwd_operators[-1].name: [ops.fwd_output_var]},
+            binding)
+        fwd_sssp_configs = nx.shortest_path(
+            fwd_ssspG, 'source', 'target', weight='weight')
+        print('Forward SSSP done')
+        binding = bind_forward_vars(vars, fwd_ssspG, fwd_sssp_configs, binding)
+    elif graph_order == 'combined':
+        print('Building combined SSSP graph')
+        combined_opG = concatenate_graphs([fwd_opG, bwd_opG])
+        ssspG = build_sssp_graph(
+            vars.ops, combined_opG, vars,
+            ops.fwd_operators[0].name,
+            {ops.fwd_operators[0].name: [ops.fwd_input_var],
+             ops.bwd_operators[0].name: [ops.bwd_input_var]},
+            {ops.fwd_operators[-1].name: [ops.fwd_output_var],
+             ops.bwd_operators[-1].name: [ops.bwd_output_var]},
+            binding, split_vars=split_vars)
+        sssp_configs = nx.shortest_path(
+            ssspG, 'source', 'target', weight='weight')
+        print('Combined SSSP done')
+        binding = bind_combined_vars(vars, ssspG, sssp_configs, binding)
+    else:
+        raise ValueError(f'Unknown graph order {graph_order}')
 
     binding = vars.minimize_binding(binding)
     vars.check_binding(binding)
@@ -262,8 +428,8 @@ def print_configurations(configs, fwd_ops, bwd_ops):
 
 def save_configuration(config, binding, vars, output_file):
     layouts = {
-        'layout_input': ('X', binding['X'].upper()),
-        'layout_output': ('SB2', binding['SB2'].upper()),
+        'input': ('X', binding['X'].upper()),
+        'output': ('SB2', binding['SB2'].upper()),
         'special_dims': {},
         'algorithms': {}
     }
@@ -292,8 +458,8 @@ def save_configuration(config, binding, vars, output_file):
         'LINB2', 'LINW2']
     # Temporary hack until I figure out how to merge things:
     binding['BKQV'] = 'Q' + binding['BK']
-    layouts['layouts_params'] = {var: binding[var].upper() for var in layouts_params_vars}
-    layouts['layouts_params'] = list(layouts['layouts_params'].items())
+    layouts['params'] = {var: binding[var].upper() for var in layouts_params_vars}
+    layouts['params'] = list(layouts['params'].items())
     layouts_forward_interm_vars = [
         'KKQQVV', 'WKKWQQWVV', 'BETA', 'ALPHA', 'ATTN_DROP_MASK', 'ATTN_DROP',
         'GAMMA', 'ATT', 'DROP1MASK', 'SB1', 'SB1_LINW1', 'DROP2', 'LIN1',
@@ -301,13 +467,13 @@ def save_configuration(config, binding, vars, output_file):
         'DROP3MASK', 'LN1', 'LN1STD', 'LN1DIFF']
     # Likewise another merging hack: (This uses the 'J' layout.)
     binding['KKQQVV'] = 'Q' + binding['QQ']
-    layouts['layout_forward_interm'] = {var: binding[var].upper() for var in layouts_forward_interm_vars}
-    layouts['layout_forward_interm'] = list(layouts['layout_forward_interm'].items())
+    layouts['forward_interm'] = {var: binding[var].upper() for var in layouts_forward_interm_vars}
+    layouts['forward_interm'] = list(layouts['forward_interm'].items())
     layouts_backward_interm_vars = [
         'DLN2', 'DRESID2', 'DLIN2', 'DDROP2', 'DLIN1', 'DLIN1_LINW1', 'DLN1',
         'DRESID1', 'DATT', 'DXATT', 'DGAMMA', 'DATTN_DROP', 'DBETA', 'DKKQQVV']
-    layouts['layout_backward_interm'] = {var: binding[var].upper() for var in layouts_backward_interm_vars}
-    layouts['layout_backward_interm'] = list(layouts['layout_backward_interm'].items())
+    layouts['backward_interm'] = {var: binding[var].upper() for var in layouts_backward_interm_vars}
+    layouts['backward_interm'] = list(layouts['backward_interm'].items())
 
     with open(output_file, 'wb') as f:
         pickle.dump(layouts, f)
@@ -323,6 +489,13 @@ if __name__ == '__main__':
         '--min_without_layout', default=False, action='store_true',
         help='Report configuration with minimum runtime, ignoring data layout')
     parser.add_argument(
+        '--graph_order', type=str, choices=['fp_first', 'bp_first', 'combined'],
+        default='bp_first',
+        help='Order to optimize graphs in')
+    parser.add_argument(
+        '--split_vars', type=str, nargs='+', default=None,
+        help='Variables to split combined graph on')
+    parser.add_argument(
         '--output_config', type=str, default=None,
         help='Output file to save configuration to')
     args = parser.parse_args()
@@ -337,6 +510,9 @@ if __name__ == '__main__':
         print_configurations(configs, fwd_ops, bwd_ops)
         sys.exit(0)
 
-    config, binding, vars = optimize_configurations(fwd_ops, bwd_ops)
+    if args.split_vars:
+        args.split_vars = [x.upper() for x in args.split_vars]
+    config, binding, vars = optimize_configurations(
+        fwd_ops, bwd_ops, args.graph_order, args.split_vars)
     if args.output_config:
         save_configuration(config, binding, vars, args.output_config)

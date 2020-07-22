@@ -8,7 +8,6 @@ import pandas as pd
 _int_kernel_cols = ['h', 'b', 'j', 'k', 'u', 'n', 'p']
 
 
-@functools.lru_cache(maxsize=None)
 def load_kernel(filename, cache=True):
     if cache:
         cache_filename = filename + '.pkl'
@@ -25,7 +24,8 @@ def load_kernel(filename, cache=True):
         parts = line.split(' ')
         for i in range(0, len(parts) - 1, 3):
             data[parts[i].lower()].append(parts[i+2].lower())
-    data['time'] = [float(t) for t in data['time']]
+    # Convert to milliseconds.
+    data['time'] = [float(t)*1000 for t in data['time']]
     # Try to convert to ints.
     for col in _int_kernel_cols:
         if col in data:
@@ -41,7 +41,6 @@ def load_kernel(filename, cache=True):
     return df
 
 
-@functools.lru_cache(maxsize=None)
 def load_tc(filename, cache=True):
     if cache:
         cache_filename = filename + '.pkl'
