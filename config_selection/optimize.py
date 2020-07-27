@@ -169,6 +169,20 @@ def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
         else:
             out_concat = False
         if vars_to_split_on:
+            if in_concat:
+                # Add edges from concat node.
+                # The output side will be handled in the recursive call.
+                in_layouts = vars.get_valid_unique_layouts(
+                    op.name, tuple(in_vars), binding=freeze_dict(binding))
+                concat_node = f'{prev_split_idx}_{index+1}_concat'
+                for layout in layout_iterator(in_layouts):
+                    cfg_binding = vars.update_binding_from_cfg(binding, layout)
+                    cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
+                    in_cfg = freeze_dict({var: cfg[var] for var in in_vars})
+                    in_node = (f'{prev_split_idx}_{index+1}', in_cfg)
+                    ssspG.add_edge(concat_node, in_node,
+                                   weight=0.0, cfg=None, op=None)
+                    #print(f'{op.name} adding in concat edge {concat_node}->{in_node}')
             layouts = vars.get_valid_unique_layouts(
                 op.name, tuple(vars_to_split_on), binding=freeze_dict(binding))
             print(f'Splitting SSSP graph on variables {", ".join(vars_to_split_on)}, {layout_len(layouts)} layouts')
@@ -187,7 +201,7 @@ def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
                 # Add edges from concat node to the input layouts for op.
                 in_layouts = vars.get_valid_unique_layouts(
                     op.name, tuple(in_vars), binding=freeze_dict(binding))
-                concat_node = f'{prev_split_idx}_{index+i-1}_concat'
+                concat_node = f'{prev_split_idx}_{index+i}_concat'
                 for layout in layout_iterator(in_layouts):
                     cfg_binding = vars.update_binding_from_cfg(binding, layout)
                     cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
@@ -195,7 +209,7 @@ def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
                     in_node = (f'{prev_split_idx}_{index+i}', in_cfg)
                     ssspG.add_edge(concat_node, in_node,
                                    weight=0.0, cfg=None, op=None)
-                    #print(f'{op.name}: adding concat edge {concat_node}->{in_node}')
+                    #print(f'{op.name}: adding in concat edge {concat_node}->{in_node}')
             add_sssp_edges_for_op(
                 ssspG, vars, op, index + i, in_vars, out_vars,
                 binding, split_idx, prev_split_idx)
@@ -203,7 +217,7 @@ def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
                 # Add edges from output layouts of op to concat node.
                 out_layouts = vars.get_valid_unique_layouts(
                     op.name, tuple(out_vars), binding=freeze_dict(binding))
-                concat_node = f'{split_idx}_{index+i}_concat'
+                concat_node = f'{split_idx}_{index+i+1}_concat'
                 for layout in layout_iterator(out_layouts):
                     cfg_binding = vars.update_binding_from_cfg(binding, layout)
                     cfg = vars.get_op_config_from_binding(op.name, cfg_binding)
@@ -211,7 +225,7 @@ def extend_sssp_graph(ssspG, vars, ops, opG, node_order, index,
                     out_node = (f'{split_idx}_{index+i+1}', out_cfg)
                     ssspG.add_edge(out_node, concat_node,
                                    weight=0.0, cfg=None, op=None)
-                    #print(f'{op.name}: adding concat edge {out_node}->{concat_node}')
+                    #print(f'{op.name}: adding out concat edge {out_node}->{concat_node}')
         # Reset since we are now past the split point.
         prev_split_idx = None
 

@@ -27,7 +27,7 @@ All times are in milliseconds (ms).
 #### BERT-large, batch size 8, max sequence length 512 runtime
 | PyTorch | TensorFlow+XLA | DeepSpeed | Substation
 |---------|----------------|-----------|-----------
-| 9.14    | 8.4            | 7.6       | 6.87
+| 9.14    | 8.4            | 7.6       | 6.71
 
 #### BERT-large, batch size 96, max sequence length 128 runtime
 | PyTorch | TensorFlow+XLA | DeepSpeed | Substation
@@ -79,7 +79,7 @@ Final configuration selection can then be run with `python optimize.py --output_
 
 The `optimize.py` script can use several strategies for performing configuration selection, controlled with the `--graph_order` argument. The default, `bp_first`, will optimize the encoder layer's backpropagation pass first, and then its forward pass. `fp_first` will optimize forward propagation first, then backpropagation. `bp_first` typically results in configurations that are faster than `fp_first`. The third option, `combined`, will optimize over forward and backpropagation simultaneously, and typically results in the fastest configurations. However, this approach is somewhat finnicky, and can often fail to find a valid layout. This can be worked around by telling the optimizer to "split" at certain variables using the `--split_vars` argument.
 
-The `layouts-bert-b8-l512-h16-e1024.pickle` configuration was generated using `optimize.py --graph_order bp_first`. The `layouts-bert-b96-l128-h16-e1024.pickle` configuration was generated using `optimize.py --graph_order combined --split_vars X DROP2 LN1`.
+The `layouts-bert-b8-l512-h16-e1024.pickle` configuration was generated using `optimize.py --graph_order combined --split_vars X LN1 LN2 LIN2 DLIN2`. The `layouts-bert-b96-l128-h16-e1024.pickle` configuration was generated using `optimize.py --graph_order combined --split_vars X DROP2 LN1`.
 
 ## Contributors
 
