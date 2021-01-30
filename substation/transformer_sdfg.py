@@ -102,7 +102,7 @@ def layer_norm_scaled(x: dace_dtype[B, SM, N], scale: dace_dtype[N],
     """
     out = np.ndarray(x.shape, x.dtype)
     mean, std = meanstd(x)
-    for i, j, k in dace.map[0:SM, 0:B, 0:N]:
+    for i, j, k in dace.map[0:B, 0:SM, 0:N]:
         with dace.tasklet:
             in_scal << scale[k]
             in_bias << bias[k]
